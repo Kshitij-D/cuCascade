@@ -25,6 +25,8 @@
 #include <rmm/aligned.hpp>
 #include <rmm/mr/cuda_async_managed_memory_resource.hpp>
 #include <rmm/mr/cuda_async_memory_resource.hpp>
+
+#include <cstdlib>
 #include <rmm/mr/cuda_async_view_memory_resource.hpp>
 
 #include <cuda/memory_resource>
@@ -462,6 +464,26 @@ void* impl_type::do_allocate_unmanaged(std::size_t allocation_bytes,
                                        ::cuda::stream_ref stream)
 {
   auto [success, post_allocation_size] = _total_allocated_bytes.try_add(tracking_bytes, _capacity);
+  // Experimental (env-gated, SIRIUS_BORROW=<headroom MiB>): the capacity check counts reserved but
+  // unused bytes as allocated, so with many padded reservations an allocation can fail here while
+  // the CUDA pool has room. When the pool's real free bytes (reserved - used) cover the request
+  // plus a headroom, borrow from that unused reserved space instead of failing.
+  if (!success && _pool_handle != nullptr) {
+    static long const borrow_mib = [] {
+      auto const* v = std::getenv("SIRIUS_BORROW");
+      return v ? std::atol(v) : -1L;
+    }();
+    if (borrow_mib >= 0) {
+      std::uint64_t reserved = 0, used = 0;
+      if (cudaMemPoolGetAttribute(_pool_handle, cudaMemPoolAttrReservedMemCurrent, &reserved) == cudaSuccess &&
+          cudaMemPoolGetAttribute(_pool_handle, cudaMemPoolAttrUsedMemCurrent, &used) == cudaSuccess &&
+          reserved > used &&
+          reserved - used >= allocation_bytes + static_cast<std::uint64_t>(borrow_mib) * (1ULL << 20)) {
+        post_allocation_size = _total_allocated_bytes.add(tracking_bytes);
+        success              = true;
+      }
+    }
+  }
   if (success) {
     _peak_total_allocated_bytes.update_peak(post_allocation_size);
     try {
