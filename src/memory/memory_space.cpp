@@ -16,6 +16,8 @@
  */
 
 #include <cucascade/cuda/stream.hpp>
+
+#include <algorithm>
 #include <cucascade/data/disk_io_backend.hpp>
 #include <cucascade/error.hpp>
 #include <cucascade/memory/common.hpp>
@@ -302,27 +304,53 @@ std::size_t memory_space::get_active_reservation_count() const
     _reservation_allocator);
 }
 
+namespace {
+// Evictable view of the downgrade levels: resident bytes are removed from both the consumed
+// amount and the capacity the fractions apply to (thresholds are fraction x capacity).
+struct evictable_levels {
+  size_t consumed, start, stop;
+};
+evictable_levels evictable(size_t consumed, size_t start, size_t stop, size_t capacity,
+                           const std::atomic<std::size_t>* resident_counter)
+{
+  if (resident_counter == nullptr || capacity == 0) { return {consumed, start, stop}; }
+  size_t const r = std::min(resident_counter->load(std::memory_order_relaxed), capacity);
+  double const f = static_cast<double>(capacity - r) / static_cast<double>(capacity);
+  return {consumed > r ? consumed - r : 0,
+          static_cast<size_t>(static_cast<double>(start) * f),
+          static_cast<size_t>(static_cast<double>(stop) * f)};
+}
+}  // namespace
+
 bool memory_space::should_downgrade_memory() const
 {
   auto available_memory = get_available_memory();
   if (available_memory >= _memory_limit) { return false; }
-  return _memory_limit - available_memory >= _start_downgrading_memory_threshold;
+  auto const l = evictable(_memory_limit - available_memory, _start_downgrading_memory_threshold,
+                           _stop_downgrading_memory_threshold, _capacity,
+                           _resident_counter.load(std::memory_order_acquire));
+  return l.consumed >= l.start;
 }
 
 bool memory_space::should_stop_downgrading_memory() const
 {
   auto available_memory = get_available_memory();
   if (available_memory >= _memory_limit) { return true; }
-  return _memory_limit - available_memory <= _stop_downgrading_memory_threshold;
+  auto const l = evictable(_memory_limit - available_memory, _start_downgrading_memory_threshold,
+                           _stop_downgrading_memory_threshold, _capacity,
+                           _resident_counter.load(std::memory_order_acquire));
+  return l.consumed <= l.stop;
 }
 
 size_t memory_space::get_amount_to_downgrade() const
 {
   auto available_memory = get_available_memory();
   if (available_memory >= _memory_limit) { return 0; }
-  size_t consumed = _memory_limit - available_memory;
-  if (consumed <= _stop_downgrading_memory_threshold) { return 0; }
-  return consumed - _stop_downgrading_memory_threshold;
+  auto const l = evictable(_memory_limit - available_memory, _start_downgrading_memory_threshold,
+                           _stop_downgrading_memory_threshold, _capacity,
+                           _resident_counter.load(std::memory_order_acquire));
+  if (l.consumed <= l.stop) { return 0; }
+  return l.consumed - l.stop;
 }
 
 size_t memory_space::get_available_memory(::cuda::stream_ref stream) const

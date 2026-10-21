@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include <atomic>
+
 #include <cucascade/memory/chunked_resource_info.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/config.hpp>
@@ -110,6 +112,14 @@ class memory_space {
   [[nodiscard]] bool should_stop_downgrading_memory() const;
   [[nodiscard]] size_t get_amount_to_downgrade() const;
 
+  /// Experimental (Sirius SIRIUS_LEDGER): bytes that are resident and not evictable (pinned
+  /// tables). When set, the downgrade start/stop levels apply to evictable bytes only:
+  /// consumed - resident against fraction x (capacity - resident).
+  void set_resident_counter(const std::atomic<std::size_t>* counter) const noexcept
+  {
+    _resident_counter.store(counter, std::memory_order_release);
+  }
+
   // State queries
   [[nodiscard]] size_t get_available_memory(::cuda::stream_ref stream) const;
   [[nodiscard]] size_t get_available_memory() const;
@@ -165,6 +175,7 @@ class memory_space {
   const memory_space_id _id;
   const size_t _capacity;
   const size_t _memory_limit;
+  mutable std::atomic<const std::atomic<std::size_t>*> _resident_counter{nullptr};
   const size_t _start_downgrading_memory_threshold;
   const size_t _stop_downgrading_memory_threshold;
   using reserving_adaptor_type = std::variant<std::unique_ptr<reservation_aware_resource_adaptor>,
