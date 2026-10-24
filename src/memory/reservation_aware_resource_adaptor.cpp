@@ -459,6 +459,17 @@ void* impl_type::do_allocate_managed(std::size_t bytes,
   }
 }
 
+namespace {
+bool hard_budget() noexcept
+{
+  static bool const on = [] {
+    auto const* v = std::getenv("SIRIUS_HARD_BUDGET");
+    return v != nullptr && *v == '1';
+  }();
+  return on;
+}
+}  // namespace
+
 void* impl_type::do_allocate_unmanaged(std::size_t allocation_bytes,
                                        std::size_t tracking_bytes,
                                        ::cuda::stream_ref stream)
@@ -478,7 +489,10 @@ void* impl_type::do_allocate_unmanaged(std::size_t allocation_bytes,
       if (cudaMemPoolGetAttribute(_pool_handle, cudaMemPoolAttrReservedMemCurrent, &reserved) == cudaSuccess &&
           cudaMemPoolGetAttribute(_pool_handle, cudaMemPoolAttrUsedMemCurrent, &used) == cudaSuccess &&
           reserved > used &&
-          reserved - used >= allocation_bytes + static_cast<std::uint64_t>(borrow_mib) * (1ULL << 20)) {
+          reserved - used >= allocation_bytes + static_cast<std::uint64_t>(borrow_mib) * (1ULL << 20) &&
+          // SIRIUS_HARD_BUDGET=1: borrowing may not take real pool use past the configured capacity,
+          // so the budget bounds real GPU memory for every policy (the pool itself reserves the GPU).
+          (!hard_budget() || used + allocation_bytes <= _capacity)) {
         post_allocation_size = _total_allocated_bytes.add(tracking_bytes);
         success              = true;
       }
